@@ -1,0 +1,222 @@
+<!--
+ index.html - THE WEB PAGE (multi-user version)
+
+ What this page does:
+   1. Asks Azure "who am I?" (/.auth/me). If nobody is signed in, it shows a
+      "Sign in with GitHub" button. Azure handles the sign-in; no passwords here.
+   2. Once signed in, it loads the SHARED warehouse from the Python API
+      (/api/simulate), which reads it from the Cosmos DB database.
+   3. Buttons send actions to the API (run days / reset). The API saves the new
+      numbers in the database and sends them back.
+   4. Every 5 seconds the page asks again, so you see what OTHER users did.
+
+ The page does NO simulating and stores NOTHING itself. The database is the
+ single source of truth, which is what lets many people share one warehouse.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Furniture Inventory Simulator</title>
+<style>
+  :root { --ink:#1d2733; --muted:#5b6673; --line:#d6dbe1; --bg:#f6f7f9; --card:#fff; --accent:#1f4e79; --ok:#2e7d32; --low:#c77700; --out:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#e8ecf1; --muted:#9aa5b1; --line:#34404c; --bg:#141a21; --card:#1c242d; --accent:#6fa8dc; --ok:#6fcf74; --low:#f0b04a; --out:#ff8a80; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.5; }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; }
+  h2 { font-size:1.05rem; margin:0 0 12px; }
+  p.sub { margin:0 0 20px; color:var(--muted); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
+  .topbar span { color:var(--muted); font-size:.9rem; }
+  .params { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; }
+  label { display:flex; flex-direction:column; font-size:.85rem; color:var(--muted); gap:4px; }
+  input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+  button, a.btn { font:inherit; padding:8px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; text-decoration:none; display:inline-block; }
+  button.alt, a.alt { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:wait; }
+  button:focus-visible, input:focus-visible, a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px; }
+  .kpi b { display:block; font-size:1.5rem; }
+  .kpi span { color:var(--muted); font-size:.85rem; }
+  .scroll { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td.n, th.n { text-align:right; }
+  .ok { color:var(--ok); } .low { color:var(--low); } .out { color:var(--out); }
+  #log { max-height:260px; overflow:auto; font-size:.88rem; margin:0; padding-left:0; list-style:none; }
+  #log li { margin-bottom:3px; }
+  #log .who { color:var(--muted); }
+  #error { color:var(--out); min-height:1.2em; margin:10px 0 0; }
+  #login { text-align:center; padding:40px 16px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Furniture Inventory Simulator</h1>
+  <p class="sub">One shared warehouse. Everyone who signs in sees and changes the same stock.</p>
+
+  <!-- Shown when nobody is signed in -->
+  <section id="login" class="hidden">
+    <h2>Sign in to continue</h2>
+    <p class="sub">Sign-in is handled by Azure using your GitHub account.</p>
+    <a class="btn" href="/.auth/login/github">Sign in with GitHub</a>
+  </section>
+
+  <!-- Shown after sign-in -->
+  <div id="app" class="hidden">
+    <div class="topbar">
+      <span>Signed in as <b id="who"></b></span>
+      <a class="btn alt" href="/.auth/logout">Sign out</a>
+    </div>
+
+    <section>
+      <h2>Rules</h2>
+      <div class="params">
+        <label>Starting stock per product<input id="startStock" type="number" min="0" value="40"></label>
+        <label>Reorder when stock falls to<input id="reorderPoint" type="number" min="0" value="15"></label>
+        <label>Units per reorder<input id="reorderQty" type="number" min="1" value="30"></label>
+        <label>Supplier lead time (days)<input id="leadTime" type="number" min="1" value="3"></label>
+        <label>Max customer orders per day (per product)<input id="maxDemand" type="number" min="1" value="8"></label>
+      </div>
+      <div class="buttons">
+        <button id="day1">Run 1 day</button>
+        <button id="day7">Run 7 days</button>
+        <button id="reset" class="alt">Reset for everyone with these rules</button>
+      </div>
+      <p id="error" role="alert"></p>
+    </section>
+
+    <section>
+      <h2>Totals</h2>
+      <div class="kpis">
+        <div class="kpi"><b id="kDay">0</b><span>Day</span></div>
+        <div class="kpi"><b id="kSold">0</b><span>Units sold</span></div>
+        <div class="kpi"><b id="kLost">0</b><span>Sales lost (out of stock)</span></div>
+        <div class="kpi"><b id="kOrders">0</b><span>Supplier orders placed</span></div>
+      </div>
+      <p class="sub" id="updated" style="margin:12px 0 0"></p>
+    </section>
+
+    <section>
+      <h2>Warehouse stock</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Product</th><th class="n">In stock</th><th class="n">On order</th><th class="n">Sold</th><th>Status</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Activity (everyone, newest first)</h2>
+      <ul id="log"></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const RULE_IDS = ["startStock", "reorderPoint", "reorderQty", "leadTime", "maxDemand"];
+let doc = null;          // the latest shared warehouse received from the API
+let busy = false;        // true while a button action is in progress
+
+// ---- STEP 1: who is signed in? ------------------------------------------
+// Azure's built-in address /.auth/me returns the signed-in user (or null).
+async function start() {
+  const res = await fetch("/.auth/me");
+  const data = await res.json();
+  if (!data.clientPrincipal) { $("login").classList.remove("hidden"); return; }
+  $("who").textContent = data.clientPrincipal.userDetails;   // textContent = safe, no HTML injection
+  $("app").classList.remove("hidden");
+  await refresh(true);
+  setInterval(() => { if (!busy && !document.hidden) refresh(false); }, 5000);   // see other users' changes
+}
+
+// ---- Talking to the Python API ------------------------------------------
+async function api(method, body) {
+  const res = await fetch("/api/simulate", {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Request failed (" + res.status + ")");
+  return data;
+}
+
+// Load the shared warehouse. fillRules = also copy its rules into the input boxes.
+async function refresh(fillRules) {
+  try {
+    doc = await api("GET");
+    if (fillRules) for (const id of RULE_IDS) $(id).value = doc.rules[id];
+    $("error").textContent = "";
+    render();
+  } catch (err) { $("error").textContent = err.message; }
+}
+
+// Run days or reset. Buttons are disabled while we wait for the database.
+async function act(body) {
+  busy = true;
+  document.querySelectorAll("button").forEach(b => b.disabled = true);
+  try {
+    doc = await api("POST", body);
+    $("error").textContent = "";
+    render();
+  } catch (err) { $("error").textContent = err.message; }
+  finally {
+    busy = false;
+    document.querySelectorAll("button").forEach(b => b.disabled = false);
+  }
+}
+
+// ---- Draw the page from the data ----------------------------------------
+function render() {
+  const s = doc.state;
+  $("kDay").textContent = s.day;
+  $("kSold").textContent = s.sold;
+  $("kLost").textContent = s.lost;
+  $("kOrders").textContent = s.orders;
+  $("updated").textContent = doc.updatedBy
+    ? "Last change by " + doc.updatedBy + " at " + new Date(doc.updatedAt).toLocaleTimeString() : "";
+
+  $("rows").innerHTML = s.items.map(it => {
+    const onOrder = it.pending.reduce((sum, p) => sum + p.qty, 0);
+    const [cls, label] =
+      it.stock === 0                     ? ["out", "Out of stock"] :
+      it.stock <= doc.rules.reorderPoint ? ["low", "Low"]          : ["ok", "Healthy"];
+    return `<tr><td>${it.name}</td><td class="n">${it.stock}</td><td class="n">${onOrder}</td>
+            <td class="n">${it.sold}</td><td class="${cls}">${label}</td></tr>`;
+  }).join("");
+
+  // Activity feed: built with textContent so a username can never inject HTML
+  $("log").replaceChildren(...doc.events.map(e => {
+    const li = document.createElement("li");
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = new Date(e.t).toLocaleTimeString() + " " + e.user + ": ";
+    li.append(who, e.msg);
+    return li;
+  }));
+}
+
+// ---- Buttons --------------------------------------------------------------
+$("day1").onclick  = () => act({ action: "run", days: 1 });
+$("day7").onclick  = () => act({ action: "run", days: 7 });
+$("reset").onclick = () => {
+  if (!confirm("Reset the shared warehouse for everyone?")) return;
+  const rules = {};
+  for (const id of RULE_IDS) rules[id] = parseInt($(id).value, 10) || 0;
+  act({ action: "reset", rules });
+};
+
+start();
+</script>
+</body>
+</html>
